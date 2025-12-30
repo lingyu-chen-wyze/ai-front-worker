@@ -1,0 +1,19 @@
+name = "ai-front-worker"
+main = "worker.js"
+compatibility_date = "2025-12-26"
+
+# KV Namespace binding
+# Create KV namespace first: wrangler kv:namespace create "KV"
+[[kv_namespaces]]
+binding = "KV"
+id = "YOUR_KV_NAMESPACE_ID"  # Replace with actual KV namespace ID
+
+# Environment variables (set via secrets)
+# wrangler secret put JWT_SECRET
+# wrangler secret put GEMINI_API_KEY
+
+# Optional: Configure custom domain
+# route = "https://api.yourapp.com/*"
+
+# Optional: Specify compatibility flags
+# [compatibility_flags]
