@@ -628,6 +628,247 @@ async function checkDailyLimit(env, installId, limit = 50) {
   return { ok: true, limit, used: next, remaining: Math.max(0, limit - next) };
 }
 
+/**
+ * Parse multipart/form-data
+ * Returns: { fields: Map<string, string>, files: Map<string, {data: Uint8Array, mime: string}> }
+ */
+async function parseMultipart(request) {
+  const contentType = request.headers.get('content-type') || '';
+  const boundaryMatch = contentType.match(/boundary=([^;]+)/);
+  if (!boundaryMatch) {
+    throw new Error('No boundary found in Content-Type');
+  }
+
+  const boundary = boundaryMatch[1].trim();
+  const bodyBuffer = await request.arrayBuffer();
+  const bodyBytes = new Uint8Array(bodyBuffer);
+  
+  const fields = new Map();
+  const files = new Map();
+  
+  // Convert boundary to bytes for binary search
+  const boundaryBytes = new TextEncoder().encode('--' + boundary);
+  const boundaryEnd = new TextEncoder().encode('--' + boundary + '--');
+  
+  let offset = 0;
+  
+  while (offset < bodyBytes.length) {
+    // Find next boundary
+    let boundaryStart = -1;
+    for (let i = offset; i < bodyBytes.length - boundaryBytes.length; i++) {
+      let match = true;
+      for (let j = 0; j < boundaryBytes.length; j++) {
+        if (bodyBytes[i + j] !== boundaryBytes[j]) {
+          match = false;
+          break;
+        }
+      }
+      if (match) {
+        boundaryStart = i;
+        break;
+      }
+    }
+    
+    if (boundaryStart === -1) break;
+    
+    offset = boundaryStart + boundaryBytes.length;
+    
+    // Skip CRLF after boundary
+    if (bodyBytes[offset] === 13 && bodyBytes[offset + 1] === 10) {
+      offset += 2;
+    }
+    
+    // Check if this is the end boundary
+    let isEnd = true;
+    for (let i = 0; i < 2; i++) {
+      if (bodyBytes[offset - 2 + i] !== 45) { // '-'
+        isEnd = false;
+        break;
+      }
+    }
+    if (isEnd) break;
+    
+    // Find end of headers (CRLFCRLF)
+    let headerEnd = -1;
+    for (let i = offset; i < bodyBytes.length - 3; i++) {
+      if (bodyBytes[i] === 13 && bodyBytes[i+1] === 10 && 
+          bodyBytes[i+2] === 13 && bodyBytes[i+3] === 10) {
+        headerEnd = i;
+        break;
+      }
+    }
+    
+    if (headerEnd === -1) break;
+    
+    // Parse headers
+    const headerBytes = bodyBytes.slice(offset, headerEnd);
+    const headerText = new TextDecoder().decode(headerBytes);
+    
+    offset = headerEnd + 4;
+    
+    // Find next boundary for content end
+    let contentEnd = -1;
+    for (let i = offset; i < bodyBytes.length - boundaryBytes.length; i++) {
+      let match = true;
+      for (let j = 0; j < boundaryBytes.length; j++) {
+        if (bodyBytes[i + j] !== boundaryBytes[j]) {
+          match = false;
+          break;
+        }
+      }
+      if (match) {
+        contentEnd = i;
+        break;
+      }
+    }
+    
+    if (contentEnd === -1) break;
+    
+    // Extract content (minus trailing CRLF)
+    let actualContentEnd = contentEnd;
+    if (bodyBytes[contentEnd - 2] === 13 && bodyBytes[contentEnd - 1] === 10) {
+      actualContentEnd = contentEnd - 2;
+    }
+    
+    const contentBytes = bodyBytes.slice(offset, actualContentEnd);
+    
+    // Parse header fields
+    const nameMatch = headerText.match(/name="([^"]+)"/);
+    if (!nameMatch) {
+      offset = contentEnd;
+      continue;
+    }
+    
+    const name = nameMatch[1];
+    const filenameMatch = headerText.match(/filename="([^"]+)"/);
+    const contentTypeMatch = headerText.match(/Content-Type:\s*([^\r\n]+)/i);
+    
+    if (filenameMatch) {
+      // It's a file - store raw bytes
+      files.set(name, {
+        data: contentBytes,
+        mime: contentTypeMatch ? contentTypeMatch[1].trim() : 'application/octet-stream',
+        filename: filenameMatch[1]
+      });
+    } else {
+      // It's a text field
+      const value = new TextDecoder().decode(contentBytes);
+      fields.set(name, value);
+    }
+    
+    offset = contentEnd;
+  }
+  
+  return { fields, files };
+}
+
+/**
+ * Call Gemini for voice transcription and reminder parsing
+ */
+async function callGeminiVoice(audioData, audioMime, options, env) {
+  const { timezone = 'America/Los_Angeles', nowTs, context = {} } = options;
+  
+  // Convert audio to base64
+  const audioBase64 = arrayBufferToBase64(audioData);
+  
+  // Log audio info for debugging
+  console.log('[VOICE] Audio info:', {
+    size: audioData.byteLength,
+    mime: audioMime,
+    base64_length: audioBase64.length,
+    base64_preview: audioBase64.substring(0, 50)
+  });
+  
+  const systemPrompt = `You are a voice reminder assistant. Your task is to:
+1. Transcribe the audio in ANY language (auto-detect: Chinese, English, or mixed)
+2. Extract reminder information (title, time, notes)
+3. Return ONLY valid JSON (no markdown, no explanation)
+
+Output schema:
+{
+  "detected_languages": ["zh", "en"],
+  "transcript": "exact transcription",
+  "reminder": {
+    "title": "concise task (remove filler like '提醒我/remind me to')",
+    "notes": "additional context or null",
+    "due_time": "RFC3339 datetime or null",
+    "timezone": "${timezone}",
+    "repeat": null,
+    "confidence": 0.0-1.0
+  },
+  "need_clarification": false,
+  "clarifying_question": null
+}
+
+Rules:
+- Use timezone="${timezone}" and current time=${nowTs || Date.now()} for relative time parsing
+- For vague times ("明天"/"tomorrow"/"今晚"), set need_clarification=true with clarifying_question
+- If no time mentioned, due_time=null, need_clarification=false
+- confidence reflects time parsing certainty (0.0-1.0)`;
+
+  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${env.GEMINI_API_KEY}`;
+  
+  const requestBody = {
+    contents: [{
+      parts: [
+        { text: systemPrompt },
+        {
+          inline_data: {
+            mime_type: audioMime,
+            data: audioBase64
+          }
+        }
+      ]
+    }],
+    generationConfig: {
+      temperature: 0.2,
+      maxOutputTokens: 512,
+      responseMimeType: "application/json"
+    }
+  };
+
+  const startTime = Date.now();
+  const response = await fetch(geminiUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(requestBody)
+  });
+  const latencyMs = Date.now() - startTime;
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error('[VOICE] Gemini request failed:', {
+      status: response.status,
+      mime: audioMime,
+      audio_size: audioData.byteLength,
+      error: errorText.slice(0, 500)
+    });
+    throw new Error(`Gemini API error: ${response.status} - ${errorText.slice(0, 500)}`);
+  }
+
+  const geminiJson = await response.json();
+  const outputText = pickModelText(geminiJson);
+  
+  if (!outputText) {
+    throw new Error('Empty response from Gemini');
+  }
+
+  // Parse JSON output
+  let result;
+  try {
+    result = JSON.parse(outputText);
+  } catch (e) {
+    // Try to extract JSON from the output
+    const extracted = extractJsonObject(outputText);
+    if (!extracted.ok) {
+      throw new Error('Invalid JSON from Gemini: ' + outputText.slice(0, 200));
+    }
+    result = extracted.value;
+  }
+
+  return { result, latencyMs };
+}
+
 
 
 export default {
@@ -969,6 +1210,163 @@ Failure:
         200,
         rateHeaders
       );
+    }
+
+    // ---- Voice Parse (Gemini voice transcription + reminder parsing) ----
+    if (url.pathname === "/v1/voice/parse") {
+      if (request.method !== "POST") return json({ ok: false, error: "POST_ONLY" }, 405);
+
+      const requestId = 'req_' + generateUUID();
+
+      // Check required env vars
+      if (!env.JWT_SECRET) {
+        return json({ request_id: requestId, error: { code: "SERVER_MISSING_JWT_SECRET", message: "Server configuration error" } }, 500);
+      }
+      if (!env.GEMINI_API_KEY) {
+        return json({ request_id: requestId, error: { code: "SERVER_MISSING_GEMINI_API_KEY", message: "Server configuration error" } }, 500);
+      }
+
+      // Auth: JWT
+      const authHeader = request.headers.get("authorization") || "";
+      if (!authHeader.startsWith("Bearer ")) {
+        return json({ request_id: requestId, error: { code: "UNAUTHORIZED", message: "Missing or invalid authorization header" } }, 401);
+      }
+
+      const token = authHeader.substring(7);
+      const verifyResult = await verifyJWT(token, env.JWT_SECRET);
+
+      if (!verifyResult.ok) {
+        return json({ request_id: requestId, error: { code: verifyResult.error, message: "Authentication failed" } }, 401);
+      }
+
+      const installId = verifyResult.payload.sub;
+      if (!installId) {
+        return json({ request_id: requestId, error: { code: "BAD_TOKEN", message: "Invalid token payload" } }, 401);
+      }
+
+      // Check daily quota
+      const rl = await checkDailyLimit(env, installId, 50);
+      if (!rl.ok) {
+        return json(
+          { request_id: requestId, error: { code: rl.error, message: "Rate limit exceeded", details: { limit: 50, used: rl.used ?? 50 } } },
+          429,
+          {
+            "X-RateLimit-Limit": "50",
+            "X-RateLimit-Remaining": "0",
+          }
+        );
+      }
+
+      const rateHeaders = {
+        "X-RateLimit-Limit": String(rl.limit),
+        "X-RateLimit-Remaining": String(rl.remaining),
+      };
+
+      // Parse request (support both multipart and JSON)
+      const contentType = request.headers.get("content-type") || "";
+      let audioData, audioMime, timezone, nowTs, context;
+
+      try {
+        if (contentType.includes("multipart/form-data")) {
+          // Parse multipart
+          const { fields, files } = await parseMultipart(request);
+          
+          const audioFile = files.get("audio");
+          if (!audioFile) {
+            return json({ request_id: requestId, error: { code: "INVALID_AUDIO", message: "Missing audio file", details: { expected_field: "audio" } } }, 400, rateHeaders);
+          }
+
+          audioData = audioFile.data;
+          audioMime = fields.get("audio_mime") || audioFile.mime;
+          timezone = fields.get("timezone") || "America/Los_Angeles";
+          nowTs = fields.get("now_ts") ? parseInt(fields.get("now_ts")) : Date.now();
+          
+          const contextStr = fields.get("context");
+          context = contextStr ? JSON.parse(contextStr) : {};
+
+        } else if (contentType.includes("application/json")) {
+          // Parse JSON
+          const body = await request.json();
+          
+          if (!body.audio_base64) {
+            return json({ request_id: requestId, error: { code: "INVALID_AUDIO", message: "Missing audio_base64 field" } }, 400, rateHeaders);
+          }
+
+          audioData = base64ToBytes(body.audio_base64);
+          audioMime = body.audio_mime || "audio/m4a";
+          timezone = body.timezone || "America/Los_Angeles";
+          nowTs = body.now_ts || Date.now();
+          context = body.context || {};
+
+        } else {
+          return json({ request_id: requestId, error: { code: "INVALID_REQUEST", message: "Content-Type must be multipart/form-data or application/json" } }, 400, rateHeaders);
+        }
+
+      } catch (e) {
+        return json({ request_id: requestId, error: { code: "INVALID_REQUEST", message: "Failed to parse request: " + e.message } }, 400, rateHeaders);
+      }
+
+      // Validate audio size (10 MB max)
+      const MAX_AUDIO_SIZE = 10 * 1024 * 1024;
+      if (audioData.byteLength > MAX_AUDIO_SIZE) {
+        return json(
+          { request_id: requestId, error: { code: "PAYLOAD_TOO_LARGE", message: "Audio file exceeds 10 MB limit", details: { size: audioData.byteLength, max_size: MAX_AUDIO_SIZE } } },
+          413,
+          rateHeaders
+        );
+      }
+
+      // Validate MIME type
+      const SUPPORTED_MIMES = ["audio/m4a", "audio/mp4", "audio/aac", "audio/wav", "audio/mpeg", "audio/mp3"];
+      if (!SUPPORTED_MIMES.includes(audioMime.toLowerCase())) {
+        return json(
+          { request_id: requestId, error: { code: "INVALID_AUDIO", message: "Unsupported audio format", details: { provided: audioMime, supported: SUPPORTED_MIMES } } },
+          400,
+          rateHeaders
+        );
+      }
+
+      // Call Gemini
+      let geminiResult, latencyMs;
+      try {
+        const result = await callGeminiVoice(audioData, audioMime, { timezone, nowTs, context }, env);
+        geminiResult = result.result;
+        latencyMs = result.latencyMs;
+      } catch (e) {
+        console.error('[VOICE] Gemini error:', e.message);
+        
+        if (e.message.includes('timeout')) {
+          return json({ request_id: requestId, error: { code: "UPSTREAM_TIMEOUT", message: "Gemini API timeout" } }, 504, rateHeaders);
+        }
+        
+        return json({ request_id: requestId, error: { code: "UPSTREAM_ERROR", message: "Gemini API error: " + e.message.slice(0, 200) } }, 502, rateHeaders);
+      }
+
+      // Build response
+      const response = {
+        request_id: requestId,
+        detected_languages: geminiResult.detected_languages || [],
+        transcript: geminiResult.transcript || "",
+        reminder: geminiResult.reminder || null,
+        need_clarification: geminiResult.need_clarification || false,
+        clarifying_question: geminiResult.clarifying_question || null,
+        model: "gemini-2.0-flash-exp",
+        latency_ms: latencyMs
+      };
+
+      // Log (don't store audio, only metadata)
+      console.log('[VOICE]', {
+        request_id: requestId,
+        install_id: installId,
+        audio_size: audioData.byteLength,
+        audio_mime: audioMime,
+        detected_languages: response.detected_languages,
+        transcript_length: response.transcript.length,
+        has_reminder: !!response.reminder,
+        latency_ms: latencyMs
+      });
+
+      return json(response, 200, rateHeaders);
     }
 
     // ---- Not Found ----
