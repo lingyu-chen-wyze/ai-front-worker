@@ -1,0 +1,7 @@
+name = "ai-front"
+main = "worker.js"
+compatibility_date = "2025-12-26"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "3bf9e481378e4b44907e611291378e16"

@@ -1,3 +1,5 @@
+const VERSION = "1.1.0";
+
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
@@ -766,7 +768,7 @@ async function parseMultipart(request) {
  * Call Gemini for voice transcription and reminder parsing
  */
 async function callGeminiVoice(audioData, audioMime, options, env) {
-  const { timezone = 'America/Los_Angeles', nowTs, context = {} } = options;
+  const { timezone = 'America/Los_Angeles', nowTs, context = {}, model = 'gemini-2.0-flash-lite' } = options;
   
   // Convert audio to base64
   const audioBase64 = arrayBufferToBase64(audioData);
@@ -806,7 +808,7 @@ Rules:
 - If no time mentioned, due_time=null, need_clarification=false
 - confidence reflects time parsing certainty (0.0-1.0)`;
 
-  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${env.GEMINI_API_KEY}`;
+  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${env.GEMINI_API_KEY}`;
   
   const requestBody = {
     contents: [{
@@ -869,6 +871,42 @@ Rules:
   return { result, latencyMs };
 }
 
+/**
+ * Verify Apple StoreKit 2 subscription JWS (JWT format)
+ * Decodes the payload to check bundleId, productId, and expiration.
+ * Note: This is a simplified version that does not verify the cryptographic signature.
+ * Security is ensured by JWT auth + App Attest on the request itself.
+ *
+ * @param {string|null} jws - Apple-signed JWS string from client
+ * @returns {{isPro: boolean, productId?: string, expiresDate?: number}}
+ */
+function verifyAppleSubscriptionJWS(jws) {
+  if (!jws) return { isPro: false };
+
+  try {
+    const parts = jws.split('.');
+    if (parts.length !== 3) return { isPro: false };
+
+    const payload = JSON.parse(base64urlDecode(parts[1]));
+
+    const validProducts = [
+      'com.justremind.pro.monthly'
+    ];
+
+    const isPro = payload.bundleId === 'lingyu.JustRemind'
+      && validProducts.includes(payload.productId)
+      && payload.expiresDate > Date.now();
+
+    if (isPro) {
+      console.log('[Subscription] ✅ Pro verified:', payload.productId, 'expires:', new Date(payload.expiresDate).toISOString());
+    }
+
+    return { isPro, productId: payload.productId, expiresDate: payload.expiresDate };
+  } catch (e) {
+    console.error('[Subscription] JWS parse error:', e.message);
+    return { isPro: false };
+  }
+}
 
 
 export default {
@@ -877,7 +915,7 @@ export default {
 
     // ---- Health ----
     if (request.method === "GET" && url.pathname === "/health") {
-      return json({ ok: true, service: "ai-front", ts: Date.now() }, 200);
+      return json({ ok: true, service: "ai-front", version: VERSION, ts: Date.now() }, 200);
     }
 
     // ---- Attestation → JWT ----
@@ -1244,27 +1282,13 @@ Failure:
         return json({ request_id: requestId, error: { code: "BAD_TOKEN", message: "Invalid token payload" } }, 401);
       }
 
-      // Check daily quota
-      const rl = await checkDailyLimit(env, installId, 50);
-      if (!rl.ok) {
-        return json(
-          { request_id: requestId, error: { code: rl.error, message: "Rate limit exceeded", details: { limit: 50, used: rl.used ?? 50 } } },
-          429,
-          {
-            "X-RateLimit-Limit": "50",
-            "X-RateLimit-Remaining": "0",
-          }
-        );
-      }
-
-      const rateHeaders = {
-        "X-RateLimit-Limit": String(rl.limit),
-        "X-RateLimit-Remaining": String(rl.remaining),
-      };
+      // Daily quota check will happen after parsing request body
+      // (need to read subscriptionJWS from multipart fields first)
 
       // Parse request (support both multipart and JSON)
       const contentType = request.headers.get("content-type") || "";
       let audioData, audioMime, timezone, nowTs, context;
+      let subscriptionJWS = null;
 
       try {
         if (contentType.includes("multipart/form-data")) {
@@ -1273,7 +1297,7 @@ Failure:
           
           const audioFile = files.get("audio");
           if (!audioFile) {
-            return json({ request_id: requestId, error: { code: "INVALID_AUDIO", message: "Missing audio file", details: { expected_field: "audio" } } }, 400, rateHeaders);
+            return json({ request_id: requestId, error: { code: "INVALID_AUDIO", message: "Missing audio file", details: { expected_field: "audio" } } }, 400);
           }
 
           audioData = audioFile.data;
@@ -1283,6 +1307,9 @@ Failure:
           
           const contextStr = fields.get("context");
           context = contextStr ? JSON.parse(contextStr) : {};
+
+          // Read subscription JWS (optional)
+          subscriptionJWS = fields.get("subscriptionJWS") || null;
 
         } else if (contentType.includes("application/json")) {
           // Parse JSON
@@ -1299,12 +1326,51 @@ Failure:
           context = body.context || {};
 
         } else {
-          return json({ request_id: requestId, error: { code: "INVALID_REQUEST", message: "Content-Type must be multipart/form-data or application/json" } }, 400, rateHeaders);
+          return json({ request_id: requestId, error: { code: "INVALID_REQUEST", message: "Content-Type must be multipart/form-data or application/json" } }, 400);
         }
 
       } catch (e) {
-        return json({ request_id: requestId, error: { code: "INVALID_REQUEST", message: "Failed to parse request: " + e.message } }, 400, rateHeaders);
+        return json({ request_id: requestId, error: { code: "INVALID_REQUEST", message: "Failed to parse request: " + e.message } }, 400);
       }
+
+      // Verify subscription status (Pro vs Free)
+      const sub = verifyAppleSubscriptionJWS(subscriptionJWS);
+      const isPro = sub.isPro;
+      console.log('[VOICE] Subscription:', { isPro, productId: sub.productId });
+
+      // Check daily quota with dynamic limit
+      const dailyLimit = isPro ? 500 : 3;
+      const rl = await checkDailyLimit(env, installId, dailyLimit);
+      if (!rl.ok) {
+        return json(
+          {
+            request_id: requestId,
+            error: {
+              code: rl.error,
+              message: "Rate limit exceeded",
+              details: {
+                limit: dailyLimit,
+                used: rl.used ?? dailyLimit,
+                is_pro: isPro,
+                upgrade_available: !isPro,
+                pro_limit: 500,
+                pro_model: "gemini-2.5-flash",
+                free_model: "gemini-2.0-flash-lite"
+              }
+            }
+          },
+          429,
+          {
+            "X-RateLimit-Limit": String(dailyLimit),
+            "X-RateLimit-Remaining": "0",
+          }
+        );
+      }
+
+      const rateHeaders = {
+        "X-RateLimit-Limit": String(rl.limit),
+        "X-RateLimit-Remaining": String(rl.remaining),
+      };
 
       // Validate audio size (10 MB max)
       const MAX_AUDIO_SIZE = 10 * 1024 * 1024;
@@ -1326,10 +1392,13 @@ Failure:
         );
       }
 
+      // Select model based on subscription tier
+      const geminiModel = isPro ? 'gemini-2.5-flash' : 'gemini-2.0-flash-lite';
+
       // Call Gemini
       let geminiResult, latencyMs;
       try {
-        const result = await callGeminiVoice(audioData, audioMime, { timezone, nowTs, context }, env);
+        const result = await callGeminiVoice(audioData, audioMime, { timezone, nowTs, context, model: geminiModel }, env);
         geminiResult = result.result;
         latencyMs = result.latencyMs;
       } catch (e) {
@@ -1350,7 +1419,7 @@ Failure:
         reminder: geminiResult.reminder || null,
         need_clarification: geminiResult.need_clarification || false,
         clarifying_question: geminiResult.clarifying_question || null,
-        model: "gemini-2.0-flash-exp",
+        model: geminiModel,
         latency_ms: latencyMs
       };
 
@@ -1358,6 +1427,8 @@ Failure:
       console.log('[VOICE]', {
         request_id: requestId,
         install_id: installId,
+        is_pro: isPro,
+        model: geminiModel,
         audio_size: audioData.byteLength,
         audio_mime: audioMime,
         detected_languages: response.detected_languages,
