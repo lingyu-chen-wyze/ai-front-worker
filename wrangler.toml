@@ -2,6 +2,13 @@ name = "ai-front"
 main = "worker.js"
 compatibility_date = "2025-12-26"
 
+[vars]
+IOS_APP_ID = "6H426D6Z23.lingyu.JustRemind"
+
 [[kv_namespaces]]
 binding = "KV"
 id = "3bf9e481378e4b44907e611291378e16"
+
+[[r2_buckets]]
+binding = "LOG_BUCKET"
+bucket_name = "just-remind"

@@ -1,4 +1,4 @@
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
@@ -1438,6 +1438,80 @@ Failure:
       });
 
       return json(response, 200, rateHeaders);
+    }
+
+    // ---- Submit Diagnostic Logs (stored in R2) ----
+    if (url.pathname === "/v1/logs/submit") {
+      if (request.method !== "POST") return json({ ok: false, error: "POST_ONLY" }, 405);
+
+      // Auth: JWT required
+      const authHeader = request.headers.get("authorization") || "";
+      if (!authHeader.startsWith("Bearer ")) {
+        return json({ ok: false, error: "UNAUTHORIZED" }, 401);
+      }
+
+      if (!env.JWT_SECRET) {
+        return json({ ok: false, error: "SERVER_MISSING_JWT_SECRET" }, 500);
+      }
+
+      const token = authHeader.substring(7);
+      const verifyResult = await verifyJWT(token, env.JWT_SECRET);
+      if (!verifyResult.ok) {
+        return json({ ok: false, error: verifyResult.error }, 401);
+      }
+
+      const installId = verifyResult.payload?.sub || "unknown";
+
+      // Parse body
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "INVALID_JSON" }, 400);
+      }
+
+      const logs = body.logs;
+      if (!logs || typeof logs !== "string") {
+        return json({ ok: false, error: "MISSING_LOGS" }, 400);
+      }
+
+      // Write to R2: just-remind bucket
+      // Key format: logs/<installId>/<timestamp>.txt
+      const now = new Date();
+      const dateStr = now.toISOString().replace(/[:.]/g, '-');
+      const key = `logs/${installId}/${dateStr}.txt`;
+
+      try {
+        // Add metadata header to the log file
+        const metadata = [
+          `Install ID: ${installId}`,
+          `Submitted: ${now.toISOString()}`,
+          `App Version: ${body.app_version || 'unknown'}`,
+          `iOS Version: ${body.ios_version || 'unknown'}`,
+          `Device: ${body.device_model || 'unknown'}`,
+          `Locale: ${body.locale || 'unknown'}`,
+          `Timezone: ${body.timezone || 'unknown'}`,
+          `IP: ${request.headers.get('cf-connecting-ip') || 'unknown'}`,
+          '---',
+          ''
+        ].join('\n');
+
+        await env.LOG_BUCKET.put(key, metadata + logs, {
+          httpMetadata: { contentType: 'text/plain; charset=utf-8' },
+          customMetadata: {
+            install_id: installId,
+            app_version: body.app_version || 'unknown',
+            submitted_at: now.toISOString(),
+          }
+        });
+
+        console.log('[LOGS] Saved diagnostic log:', { key, install_id: installId, size: logs.length });
+
+        return json({ ok: true, key });
+      } catch (err) {
+        console.error('[LOGS] R2 write error:', err.message);
+        return json({ ok: false, error: "STORAGE_ERROR" }, 500);
+      }
     }
 
     // ---- Not Found ----
